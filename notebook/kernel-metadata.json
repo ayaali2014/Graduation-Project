@@ -1,0 +1,21 @@
+{
+  "id": "ayaali2002/final-nb",
+  "id_no": 61138172,
+  "title": "final_nb",
+  "code_file": "final-nb.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [
+    "ayaali2002/face-landmarks",
+    "ayaali2002/final-ds",
+    "ayaali2002/gbDataset"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}
