@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pymysql
+passlib[bcrypt]
+python-multipart
+pydantic[email]
+opencv-python
+numpy
+scikit-learn
+tensorflow
+dlib
+kaggle

@@ -1,2 +1,14 @@
 env/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+!.env.example
 nb_output/Frames/
+dataset/uploads/
+graduation.db
+*.sqlite3
+*.h5
+*.dat

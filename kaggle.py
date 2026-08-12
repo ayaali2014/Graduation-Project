@@ -1,61 +1,35 @@
+import os
 import subprocess
-import shlex
-
-project_path = r'C:\\Users\\Abdelrhman Ali\\Downloads\\graduation'
-nb_id = 'WRITE_YOUR_NOTEBOOK_ID_HERE'
+from pathlib import Path
 
 
-def execute_terminal_command(command):
-    # Execute the command
-    command_list = shlex.split(command)
-    result = subprocess.run(command_list, shell=True, text=True, capture_output=True)
-    # Print the output of the command
+PROJECT_PATH = Path(os.getenv("PROJECT_PATH", Path(__file__).resolve().parent))
+DATASET_ID = os.getenv("KAGGLE_DATASET_ID", "ayaali2002/gbDataset")
+NOTEBOOK_ID = os.getenv("KAGGLE_NOTEBOOK_ID", "ayaali2002/final-nb")
+KAGGLE_TIMEOUT = int(os.getenv("KAGGLE_TIMEOUT", "300"))
+
+
+def run_command(*args: str) -> str:
+    result = subprocess.run(
+        ["kaggle", *args],
+        cwd=PROJECT_PATH,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=KAGGLE_TIMEOUT,
+    )
     return result.stdout
 
-def init_kaggle_dataset():
-    #command = fr'kaggle datasets init -p {project_path}\\dataset'
-    command = fr'kaggle datasets init -p "C:\Users\Abdelrhman Ali\Downloads\graduation\dataset"'
-    print(command)
-    return execute_terminal_command(command)
 
+def run_workflow() -> dict[str, str]:
+    dataset_path = PROJECT_PATH / "dataset"
+    notebook_path = PROJECT_PATH / "notebook"
+    output_path = PROJECT_PATH / "nb_output"
+    output_path.mkdir(parents=True, exist_ok=True)
 
-def create_kaggle_dataset():
-    command = fr'kaggle datasets create -p "C:\Users\Abdelrhman Ali\Downloads\graduation\dataset" -r tar'
-    return execute_terminal_command(command)
-
-
-def pull_kaggle_dataset(dataset_id):
-    command = fr'kaggle datasets metadata -p "C:\Users\Abdelrhman Ali\Downloads\graduation\dataset" {dataset_id}'
-    return execute_terminal_command(command)
-
-
-def update_kaggle_dataset():
-    command = fr'kaggle datasets version -p "C:\Users\Abdelrhman Ali\Downloads\graduation\dataset" -m "Updated dataset using kaggle API 2024" -r tar'
-    return execute_terminal_command(command)
-
-# def pull_kaggle_notebook():
-#     command = fr'kaggle kernels pull "ayaali2002/final-nb" -p "C:\Users\Abdelrhman Ali\Downloads\graduation\notebook" -m'
-#     return execute_terminal_command(command)
-
-
-def push_kaggle_notebook():
-    command = fr'kaggle kernels push -p "C:\Users\Abdelrhman Ali\Downloads\graduation\notebook"'
-    return execute_terminal_command(command)
-
-
-def get_notebook_status():
-    command = fr'kaggle kernels status "ayaali2002/final-nb"'
-    return execute_terminal_command(command)
-
-
-def get_notebook_output():
-    command = fr'kaggle kernels output "ayaali2002/final-nb" -p "C:\Users\Abdelrhman Ali\Downloads\graduation\nb_output"'
-    return execute_terminal_command(command)
-
-print(get_notebook_output())
-
-
-    
-
-
-#print("hello")
+    return {
+        "dataset": run_command("datasets", "metadata", "-p", str(dataset_path), DATASET_ID),
+        "notebook_push": run_command("kernels", "push", "-p", str(notebook_path)),
+        "status": run_command("kernels", "status", NOTEBOOK_ID),
+        "output": run_command("kernels", "output", NOTEBOOK_ID, "-p", str(output_path)),
+    }
