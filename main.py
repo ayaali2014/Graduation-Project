@@ -1,176 +1,208 @@
-from operator import and_
-from fastapi import FastAPI, HTTPException, Response, status
-from fastapi import Depends
-from fastapi.params import Path
-from pydantic import BaseModel
-from passlib.context import CryptContext
-from fastapi import FastAPI, File, UploadFile, Query
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import subprocess
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from typing import Annotated, Optional
-from sqlalchemy import Column, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-#from jose import JWTError, jwt  # For JWT (not shown)
-from datetime import datetime, timedelta  # For JWT (not shown)
-import magic
-from database import engine  # Assuming this is your database connection engine
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy.orm import Session
+
 import models
-from fastapi import UploadFile
-from pyngrok import ngrok
-import os
-#import uuid
-# Start the ngrok tunnel
+from database import Base, SessionLocal, engine
 
-import subprocess
-import shlex
-# Fix the typo: User (uppercase U)
-class User(declarative_base()):
-    __tablename__ = 'users'
 
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True)
-    email = Column(String(100))
-    password = Column(String(50))  # Store the hashed password
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", BASE_DIR / "dataset" / "uploads"))
+OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", BASE_DIR / "nb_output" / "arabic_word.txt"))
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 100 * 1024 * 1024))
+SECRET_KEY = os.getenv("SECRET_KEY")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+ENABLE_KAGGLE_ENDPOINT = os.getenv("ENABLE_KAGGLE_ENDPOINT", "false").lower() == "true"
+TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "60"))
+ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/x-msvideo"}
 
-# Dependency for creating database sessions (assuming 'database.py' defines engine)
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY must be set before starting the application")
+
+app = FastAPI(title="Arabic Lip-Reading API")
+Base.metadata.create_all(bind=engine)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+configured_origins = os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in configured_origins.split(",") if origin.strip()],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Token"],
+)
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=50)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: EmailStr
+
+    class Config:
+        orm_mode = True
+
+
 def get_db():
-    db = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
+    db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
+
 db_dependency = Annotated[Session, Depends(get_db)]
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")  # Define token URL endpoint
-# JWT configuration
-SECRET_KEY = "your_secret_key"  # Replace with a strong, secure secret key
-ALGORITHM = "HS256"
 
-app = FastAPI()
-models.Base.metadata.create_all(bind=engine)  # Create tables if they don't exist
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-origins = [
-    "http://localhost:8000", # Example origin for development
-    "http://127.0.0.1:8000", # Replace with your actual domain
-    # Add more origins as needed
-]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-class UserBase(BaseModel):
-    username: str
-    email: str
-    password: str
 
-@app.post("/users/", status_code=status.HTTP_201_CREATED)
-async def create_user(db: db_dependency,param1: Optional[str] = None, param2: Optional[str] = None, param3: Optional[str] = None):
+def verify_password(password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(password, hashed_password)
+
+
+def create_token(subject: str) -> str:
+    expires = int((datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE_MINUTES)).timestamp())
+    payload = json.dumps({"sub": subject, "exp": expires}, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    signature = hmac.new(SECRET_KEY.encode(), encoded.encode(), hashlib.sha256).digest()
+    return f"{encoded}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+
+
+def decode_token(token: str) -> str:
     try:
-        db_user = User(
-            username=param1,
-            email=param2,
-            password=param3
-        )
-        db.add(db_user)
-        db.commit()
-        db.refresh(db_user)
-        return {"message": "User created successfully"}
-    except Exception as e:  # Consider more specific exceptions for better error handling
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(SECRET_KEY.encode(), encoded.encode(), hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        if not hmac.compare_digest(expected, supplied):
+            raise ValueError
+        payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        claims = json.loads(payload)
+        if claims["exp"] < int(datetime.now(timezone.utc).timestamp()):
+            raise ValueError
+        return claims["sub"]
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
 
-@app.get("/users/")
-def read_root( db: db_dependency,param1: Optional[str] = None, param2: Optional[str] = None):
-    if param1 is None or param2 is None:
-        raise HTTPException(status_code=400, detail="Both email and password are required")
-    
-    user = db.query(User).filter(and_(User.email == param1, User.password == param2)).first()
+
+def current_user(token: Annotated[str, Depends(oauth2_scheme)], db: db_dependency) -> models.User:
+    email = decode_token(token)
+    user = db.query(models.User).filter(models.User.email == email).first()
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=401, detail="User not found")
     return user
-#######################################################################################################
-from secrets import token_hex
-@app.post('/files')
-async def get_file(file: UploadFile = File(...),):
-    file_ex = file.filename.split(".").pop()
-    file_name = token_hex(10)
-    file_path = fr"C:\Users\Abdelrhman Ali\Downloads\graduation\dataset\{file_name}.{file_ex}"
-    with open(file_path, "wb") as f:
-        contents = await file.read()  # For FastAPI
-        f.write(contents)
-    return {'message': f"File '{file_path}' uploaded successfully."}
 
 
-##########################################################################################################
-@app.get("/download")
-async def download_file():
-    # Specify the file path
-    file_path = r"C:\Users\Abdelrhman Ali\Downloads\graduation\nb_output\arabic_word.txt"
-
-    # Read the file content
-    with open(file_path, "r", encoding='utf-8') as file:
-        file_content = file.read()
-
-    # Return the file as a response
-    return Response(
-        content=file_content,
-        media_type="text/plain",
-        headers={
-            "Content-Disposition": f"attachment; filename=file.txt"
-        }
+@app.post("/users/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def create_user(user_data: UserCreate, db: db_dependency):
+    if db.query(models.User).filter(
+        (models.User.email == user_data.email) | (models.User.username == user_data.username)
+    ).first():
+        raise HTTPException(status_code=409, detail="Username or email already exists")
+    user = models.User(
+        username=user_data.username,
+        email=user_data.email,
+        password=hash_password(user_data.password),
     )
-
-###############################################################################################################
-###################################### kaggle ###############################################################
-def execute_terminal_command(command):
-    # Execute the command
-    command_list = shlex.split(command)
-    result = subprocess.run(command_list, shell=True, text=True, capture_output=True)
-    # Print the output of the command
-    return result.stdout
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
-def pull_kaggle_dataset():
-    command = fr'kaggle datasets metadata -p "C:\Users\Abdelrhman Ali\Downloads\graduation\dataset" "ayaali2002/gbDataset"'
-    return execute_terminal_command(command)
+@app.post("/login")
+def login(credentials: LoginRequest, db: db_dependency):
+    user = db.query(models.User).filter(models.User.email == credentials.email).first()
+    if user is None or not verify_password(credentials.password, user.password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return {"access_token": create_token(user.email), "token_type": "bearer"}
 
 
-def update_kaggle_dataset():
-    command = fr'kaggle datasets version -p "C:\Users\Abdelrhman Ali\Downloads\graduation\dataset" -m "dataset using kaggle API 2024" -r tar'
-    return execute_terminal_command(command)
+@app.get("/users/me", response_model=UserResponse)
+def read_current_user(user: Annotated[models.User, Depends(current_user)]):
+    return user
 
 
-def push_kaggle_notebook():
-    command = fr'kaggle kernels push -p "C:\Users\Abdelrhman Ali\Downloads\graduation\notebook"'
-    return execute_terminal_command(command)
+def ensure_upload_dir() -> None:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_notebook_status():
-    command = fr'kaggle kernels status "ayaali2002/final-nb"'
-    return execute_terminal_command(command)
+@app.post("/files")
+async def upload_file(
+    file: UploadFile = File(...),
+    user: Annotated[models.User, Depends(current_user)] = None,
+):
+    if file.content_type not in ALLOWED_VIDEO_TYPES:
+        raise HTTPException(status_code=415, detail="Only supported video files are accepted")
+
+    ensure_upload_dir()
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".avi"}:
+        raise HTTPException(status_code=415, detail="Unsupported video extension")
+
+    destination = UPLOAD_DIR / f"{secrets.token_hex(16)}{suffix}"
+    size = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(status_code=413, detail="Uploaded file is too large")
+                output.write(chunk)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    return {"message": "File uploaded successfully", "filename": destination.name}
 
 
-def get_notebook_output():
-    command = fr'kaggle kernels output "ayaali2002/final-nb" -p "C:\Users\Abdelrhman Ali\Downloads\graduation\nb_output"'
-    return execute_terminal_command(command)
+@app.get("/download")
+def download_file(user: Annotated[models.User, Depends(current_user)]):
+    from fastapi.responses import FileResponse
+
+    if not OUTPUT_FILE.is_file():
+        raise HTTPException(status_code=404, detail="Prediction output is not available")
+    return FileResponse(OUTPUT_FILE, media_type="text/plain", filename="arabic_word.txt")
 
 
+@app.post("/kaggle")
+def kaggle_commands(x_admin_token: str | None = Header(default=None)):
+    if not ENABLE_KAGGLE_ENDPOINT:
+        raise HTTPException(status_code=404, detail="Kaggle workflow is disabled")
+    if not ADMIN_TOKEN or not hmac.compare_digest(x_admin_token or "", ADMIN_TOKEN):
+        raise HTTPException(status_code=403, detail="Administrator access required")
 
-@app.get("/kaggle")
-async def kaggle_commands():
-    pull_ds = await pull_kaggle_dataset()
-    print(pull_ds)
-    update_ds = await update_kaggle_dataset()
-    print(update_ds)
-    push_nb = await push_kaggle_notebook()
-    print(push_nb)
-    status = await get_notebook_status()
-    if("complete" in status):
-        get_notebook_output()   
+    from kaggle import run_workflow
 
-
+    try:
+        return run_workflow()
+    except subprocess.CalledProcessError:
+        raise HTTPException(status_code=502, detail="Kaggle command failed")
