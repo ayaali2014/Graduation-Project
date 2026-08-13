@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
+import magic
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
@@ -169,12 +171,21 @@ async def upload_file(
 
     destination = UPLOAD_DIR / f"{secrets.token_hex(16)}{suffix}"
     size = 0
+    content_verified = False
     try:
         with destination.open("wb") as output:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_UPLOAD_SIZE:
                     raise HTTPException(status_code=413, detail="Uploaded file is too large")
+                if not content_verified:
+                    detected_type = magic.from_buffer(chunk, mime=True)
+                    if detected_type not in ALLOWED_VIDEO_TYPES:
+                        raise HTTPException(
+                            status_code=415,
+                            detail="Uploaded file content does not match an allowed video type",
+                        )
+                    content_verified = True
                 output.write(chunk)
     except HTTPException:
         destination.unlink(missing_ok=True)
@@ -194,7 +205,7 @@ def download_file(user: Annotated[models.User, Depends(current_user)]):
 
 
 @app.post("/kaggle")
-def kaggle_commands(x_admin_token: str | None = Header(default=None)):
+async def kaggle_commands(x_admin_token: str | None = Header(default=None)):
     if not ENABLE_KAGGLE_ENDPOINT:
         raise HTTPException(status_code=404, detail="Kaggle workflow is disabled")
     if not ADMIN_TOKEN or not hmac.compare_digest(x_admin_token or "", ADMIN_TOKEN):
@@ -203,6 +214,6 @@ def kaggle_commands(x_admin_token: str | None = Header(default=None)):
     from kaggle import run_workflow
 
     try:
-        return run_workflow()
+        return await run_in_threadpool(run_workflow)
     except subprocess.CalledProcessError:
         raise HTTPException(status_code=502, detail="Kaggle command failed")
